@@ -1,0 +1,22 @@
+# 构建产物 / IDE 本地文件
+/.hvigor/
+/build/
+**/build/
+/.cxx/
+**/.cxx/
+/oh_modules/
+**/oh_modules/
+/node_modules/
+**/node_modules/
+/.idea/
+/local.properties
+*.iml
+*.log
+
+# 签名材料绝对不要提交
+*.p12
+*.cer
+*.p7b
+*.jks
+*.keystore
+signing/
