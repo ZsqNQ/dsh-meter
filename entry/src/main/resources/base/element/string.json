@@ -2,15 +2,15 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "测光表主模块"
+      "value": "轻测光主模块"
     },
     {
       "name": "EntryAbility_desc",
-      "value": "测光表"
+      "value": "轻测光"
     },
     {
       "name": "EntryAbility_label",
-      "value": "测光表"
+      "value": "轻测光"
     },
     {
       "name": "camera_reason",

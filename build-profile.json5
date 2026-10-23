@@ -1,6 +1,6 @@
 {
   "app": {
-    "products": [
+        "products": [
       {
         "name": "default",
         "compatibleSdkVersion": "26.0.0",
@@ -10,7 +10,7 @@
     ],
     "buildModeSet": [
       {
-        "name": "debug"
+        "name": "debug",
       },
       {
         "name": "release"

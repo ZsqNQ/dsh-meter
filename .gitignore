@@ -1,22 +1,33 @@
-# 构建产物 / IDE 本地文件
-/.hvigor/
+# 构建产物
 /build/
-**/build/
-/.cxx/
-**/.cxx/
+/entry/build/
+/entry/.test/
+/entry/oh_modules/
 /oh_modules/
-**/oh_modules/
-/node_modules/
-**/node_modules/
-/.idea/
-/local.properties
-*.iml
-*.log
+.hvigor/
+.cxx/
+*.hap
+*.app
 
-# 签名材料绝对不要提交
+# 构建产物（发布包单独放 release/，但默认不入库，改用 Release 上传）
+/release/
+
+# 本机环境
+local.properties
+.idea/
+.DS_Store
+Thumbs.db
+*.iml
+
+# 签名材料：绝不允许入库
 *.p12
 *.cer
 *.p7b
-*.jks
 *.keystore
-signing/
+*.jks
+
+# 日志
+*.log
+
+# 临时备份
+*.bak

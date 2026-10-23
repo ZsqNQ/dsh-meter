@@ -1,3 +1,7 @@
+// 轻测光 · Light Meter for HarmonyOS
+// Copyright (C) 2026 南秋 (nanqiu)
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';

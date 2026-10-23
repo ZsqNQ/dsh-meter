@@ -1,3 +1,7 @@
+// 轻测光 · Light Meter for HarmonyOS
+// Copyright (C) 2026 南秋 (nanqiu)
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 /**
  * 测光核心算法（ArkTS 版）
  *
@@ -187,6 +191,8 @@ export interface Combo {
   shutterText: string;
   /** 取整到 1/3 档后残留误差，单位档 */
   errorStops: number;
+  /** 理论需求值：A 档是所需快门秒数，S 档是所需光圈 f 值；用于判断超出哪一端 */
+  exact: number;
   /** 所需快门超出 1/16000~60s */
   outOfRange: boolean;
   /** 慢于 1s：胶片会倒易律失效 */
@@ -242,6 +248,7 @@ export function comboFor(ev100: number, iso: number, aperture: number): Combo {
     shutterIndex: shutterIndex,
     shutterText: formatShutterSecond(shutter),
     errorStops: errorStops,
+    exact: exactSeconds,
     outOfRange: outOfRange,
     longExposure: shutter > 1
   };
@@ -271,6 +278,7 @@ export function comboFromShutter(ev100: number, iso: number, shutter: number): C
     shutterIndex: Math.max(0, SHUTTER_LADDER.indexOf(shutter)),
     shutterText: formatShutterSecond(shutter),
     errorStops: errorStops,
+    exact: exactAperture,
     outOfRange: outOfRange || shutter < fastest || shutter > slowest,
     longExposure: shutter > 1
   };
@@ -288,4 +296,68 @@ export function describeEv(ev100: number): string {
   if (ev100 >= 3) return '昏暗室内';
   if (ev100 >= 1) return '弱光 / 烛光附近';
   return '极弱光';
+}
+
+// ---------------- 变焦滑条映射（v1.2 原生 zoom） ----------------
+
+/**
+ * 手机 zoom 范围（测试机 MRT-AL10 是 0.55~100）直接线性铺在滑条上，1x 会挤在最左边
+ * 0.5% 的位置，没法用；纯对数刻度能拖，但 10x 以上的数字变焦会白占 44% 行程。
+ *
+ * 所以分两段：
+ *   光学/混合段  min ~ 10x  占 75% 行程，对数分布（每翻一倍一样长）
+ *   数字变焦段  10x ~ max   占 25% 行程，同样对数分布
+ * 设备上限本来就 <=10x 时只有一段，退化成纯对数刻度。
+ * 与 reference/metering.mjs 同一套实现，那边有 43 项 Node 用例把关。
+ */
+export const ZOOM_SPLIT_RATIO: number = 10;
+export const ZOOM_OPTICAL_SHARE: number = 0.75;
+
+export function zoomToSliderPos(ratio: number, minRatio: number, maxRatio: number,
+  span: number = 1000): number {
+  if (!(minRatio > 0) || !(maxRatio > minRatio)) {
+    return 0;
+  }
+  const r: number = Math.min(maxRatio, Math.max(minRatio, ratio));
+  const split: number = Math.min(Math.max(ZOOM_SPLIT_RATIO, minRatio), maxRatio);
+  if (split >= maxRatio) {
+    const t: number = Math.log(r / minRatio) / Math.log(maxRatio / minRatio);
+    return Math.round(t * span);
+  }
+  if (r <= split) {
+    const t: number = Math.log(r / minRatio) / Math.log(split / minRatio);
+    return Math.round(t * span * ZOOM_OPTICAL_SHARE);
+  }
+  const t: number = Math.log(r / split) / Math.log(maxRatio / split);
+  return Math.round((ZOOM_OPTICAL_SHARE + (1 - ZOOM_OPTICAL_SHARE) * t) * span);
+}
+
+export function sliderPosToZoom(pos: number, minRatio: number, maxRatio: number,
+  span: number = 1000): number {
+  if (!(minRatio > 0) || !(maxRatio > minRatio)) {
+    return 1;
+  }
+  const t: number = Math.min(1, Math.max(0, pos / span));
+  const split: number = Math.min(Math.max(ZOOM_SPLIT_RATIO, minRatio), maxRatio);
+  if (split >= maxRatio) {
+    return minRatio * Math.pow(maxRatio / minRatio, t);
+  }
+  if (t <= ZOOM_OPTICAL_SHARE) {
+    return minRatio * Math.pow(split / minRatio, t / ZOOM_OPTICAL_SHARE);
+  }
+  return split * Math.pow(maxRatio / split, (t - ZOOM_OPTICAL_SHARE) / (1 - ZOOM_OPTICAL_SHARE));
+}
+
+/** 变焦显示：>=10 取整，1~10 一位小数，<1 保留两位（0.55x 不能显示成 0.6x） */
+export function formatZoom(ratio: number): string {
+  if (!(ratio > 0)) {
+    return '--';
+  }
+  if (ratio >= 10) {
+    return `${Math.round(ratio)}x`;
+  }
+  if (ratio >= 1) {
+    return `${ratio.toFixed(1)}x`;
+  }
+  return `${Math.round(ratio * 100) / 100}x`;
 }
