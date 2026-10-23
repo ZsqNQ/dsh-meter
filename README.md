@@ -38,10 +38,11 @@ EV    = EV100 + 2.2 · log2(局部亮度 / 参考亮度) + 校准 + 曝光补偿
 - **A / S 双档**：A 档锁光圈算快门，S 档锁快门算光圈；超出档位表时滚轮停在首尾的空白档。
 - **光圈自动识别**：相机 API 读不到光圈（多数华为机型如此），就用 0.4s 一次的低分辨率静默拍照读 EXIF。
 - **支持机型实测**：HUAWEI MRT-AL10 / HarmonyOS 7.0.0.109 / API 26。
+- **仓库**：<https://github.com/ZsqNQ/dsh-meter>　|　**下载**：[Releases](https://github.com/ZsqNQ/dsh-meter/releases)
 
 ## 安装
 
-- 从本仓库的 **Releases** 页面下载 `轻测光-vX.Y.Z.hap`。
+- 从本仓库的 **Releases** 页面下载 `qing-ce-guang-vX.Y.Z.hap`（v1.2.0 已上传）。
 - 该 hap 用**开发者调试证书**签名，一般只能装在已注册设备上；其他设备请自行构建并用你的证书签名：
 
 **推荐**：用 DevEco Studio 打开工程 → 配好签名 → `Build → Build Hap(s)`。

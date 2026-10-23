@@ -489,8 +489,12 @@ $HDC shell uitest uiInput click 640 1200              # 点击 / longClick / swi
   本机原配置备份在工作区 `tmp/build-profile.signed.json5.bak`（不要外传）。
 - 新增文档：`README.md`、`docs/USER_GUIDE.md`、`docs/HANDOVER.md`、`CHANGELOG.md`、`LICENSE`、`.gitignore`；
   截图在 `docs/images/`。
-- 上线前待办：`git remote add origin <你的仓库>` → `git push -u origin main` → 建 tag `v1.2.0` →
-  把 hap 作为 Release asset 上传（说明里注明"调试证书签名，其他设备请自行构建"）。
+- **已发布**：<https://github.com/ZsqNQ/dsh-meter>（仓库沿用旧的 `dsh-meter`，在 v1.1.0 之后迭代）。
+  - 分支 `main`；tag `v1.2.0`；Release「轻测光 v1.2.0」，asset `qing-ce-guang-v1.2.0.hap`（658,676 B）。
+  - GitHub 已识别许可为 **AGPL-3.0**（LICENSE 正文以官方文本开头，版权声明在文末）。
+  - 仓库话题：harmonyos / arkts / light-meter / film-photography / camera / agpl。
+  - 旧的 `release/DSH-Meter-v1.1.0.hap` 已从 git 树上移除（历史里仍有），今后安装包统一走 GitHub Releases。
+  - 上传中文文件名会被 GitHub 丢掉，asset 名改用 ASCII（`qing-ce-guang-vX.Y.Z.hap`）。
 
 ### 9.12 尚未做
 
