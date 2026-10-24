@@ -14,6 +14,7 @@
   <img src="docs/images/idle.jpg" width="240">
   <img src="docs/images/continuous.jpg" width="240">
   <img src="docs/images/locked.jpg" width="240">
+  <img src="docs/images/settings.jpg" width="240">
 </p>
 
 ## 它是怎么测的
