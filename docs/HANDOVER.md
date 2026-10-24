@@ -1,27 +1,40 @@
 # 交接文档 · 轻测光
 
-> 当前版本：**v1.2.0**（versionCode 1020000，包名 `com.nanqiu.meter`）
+> 当前版本：**v1.2.1**（versionCode 1020001，包名 `com.nanqiu.meter`）
 > 验证设备：HUAWEI MRT-AL10 / HarmonyOS 7.0.0.109 / API 26
 > 这份文档除了讲"现在是什么样"，更重点写"为什么是这样"——包括走错的路，避免下一版重踩。
 
 ## 0. 仓库结构
 
+**先看这里 —— 代码和文档不在同一个目录**：
+
+| 位置 | 放什么 |
+|---|---|
+| `D:\DevEcoProjects\DSH-Meter` | **工程本体**：git 仓库、`AppScope/`、`entry/`、`docs/`、`release/`。要改代码来这里。 |
+| `D:\AAA个人文件\DSH鸿蒙测光表` | **文档工作区**：本文件副本、`reference/`（算法 JS 版 + Node 用例）、`scripts/`、`tmp/`。**这里没有源码。** 里面的 `README.md` 是早期的设计说明，**不是**仓库 README 的副本，别拿它当对外文档。 |
+
+- 两份 `HANDOVER.md`（文档工作区根目录 与 仓库 `docs/HANDOVER.md`）内容应完全一致，改完一边要同步另一边。
+- 文档工作区里的 `HANDOVER.md.bak` 是 **v1.1.0** 的旧版，只作对照，别照着它改代码。
+- 下文所有路径都是**仓库内相对路径**。
+
 ```
 AppScope/app.json5                     包名、版本、图标、应用名
 AppScope/resources/base/media/app_icon.png   应用图标（1024×1024，白底黑光圈）
 entry/src/main/ets/
-  pages/Index.ets             全部 UI + 相机会话 + 取帧 + 状态（主战场，约 2200 行）
-  common/Metering.ets         纯算法：EV、1/3 档档位表、曝光组合、变焦滑条映射
-  common/ApertureMonitor.ets  光圈/镜头监测（EXIF 轮询、校验、锁定联动、轮询节流）
-  common/ShotAperture.ets     静默拍照读 EXIF 的底层实现
-  entryability/EntryAbility.ets  窗口全屏 + 系统栏配色
-docs/                          本文件、用户手册、截图
+  pages/Index.ets             全部 UI + 相机会话 + 取帧 + 状态（主战场，实测 2567 行）
+  common/Metering.ets         纯算法：EV、1/3 档档位表、曝光组合、变焦滑条映射（363 行）
+  common/ApertureMonitor.ets  光圈/镜头监测（EXIF 轮询、校验、锁定联动、轮询节流，317 行）
+  common/ShotAperture.ets     静默拍照读 EXIF 的底层实现（213 行）
+  entryability/EntryAbility.ets  窗口全屏 + 系统栏配色（65 行）
+docs/HANDOVER.md               本文件
+docs/USER_GUIDE.md             用户手册
+docs/images/                   截图（README 与用户手册引用）
 release/                       构建产物（不入库，走 GitHub Releases）
 ```
 
 公开仓库**不含签名材料**：`build-profile.json5` 里的 `signingConfigs` 已删除，
 构建前用 DevEco Studio → File → Project Structure → Signing Configs → 自动生成签名即可。
-`reference/` 下的算法 JS 版本与 Node 用例只在本地工作区，不在仓库里（用作算法回归）。
+`reference/`（算法 JS 版 + Node 用例）与 `scripts/` 只在文档工作区，不在仓库里。
 
 ---
 
@@ -35,13 +48,17 @@ release/                       构建产物（不入库，走 GitHub Releases）
 
 ## 2. 代码结构
 
+（完整目录与行数见 §0，这里只列职责）
+
 ```
 entry/src/main/ets/
-  pages/Index.ets            全部 UI + 相机会话 + 帧采样 + 状态（约 1100 行）
-  common/Metering.ets        纯算法：EV、1/3 档档位表、组合计算、快门格式化
-  entryability/EntryAbility.ets   窗口全屏 + 系统栏配色
+  pages/Index.ets                全部 UI + 相机会话 + 帧采样 + 状态（2567 行，主战场）
+  common/Metering.ets            纯算法：EV、1/3 档档位表、组合计算、快门格式化、变焦映射
+  common/ApertureMonitor.ets     EXIF 光圈轮询与校验（锁定联动、轮询节流）
+  common/ShotAperture.ets        静默拍照读 EXIF 的底层实现（parseRational 等）
+  entryability/EntryAbility.ets  窗口全屏 + 系统栏配色
   entrybackupability/...
-AppScope/app.json5           版本号（versionName / versionCode）
+AppScope/app.json5               版本号（versionName / versionCode）
 ```
 
 ### 数据流
@@ -233,17 +250,91 @@ this.safeBottom = px2vp(nav.bottomRect.height);
 - **开发者模式 + 锁屏状态下 `aa start` 会失败**，先唤醒解锁。
 - **hilog 缓冲很小**：应用启动时的日志几分钟内就被系统日志冲掉，验证要用"清缓冲 → 触发 → 立刻抓"的顺序。
 
+### 4.9 锁定后算出来的那一侧一直盖着 XX（v1.2.0 的 bug，已修）
+
+**现象**：冷启动后**第一次**直接点「锁定曝光」，EV 正常出数、底部也写「已锁定 · 可移动测光点」，
+但算出来的那一侧（A 档快门 / S 档光圈）一直盖着 XX。再解锁、再锁一次就正常了。
+
+**根因**：XX 遮罩的 `if (… && !this.computedKnown())` 里，`computedKnown()` 读的是普通字段
+`lastRawEv`，不是 `@State`。ArkUI 的 `if` 分支只在**它依赖的可观察状态**变化时重算；
+`lastRawEv` 变了不算数。而 `locked` / `meteringOn` 早在测量完成前就翻过了，遮罩被判定"要显示"
+之后就再没有触发过重算。EV 之所以正常，是因为 `evText` 是 `@State`，那个 `Text` 会单独刷新。
+
+**修法**（v1.2.1）：加 `@State evKnown`，所有 EV 写入统一走 `setRawEv(v)`（同时写 `lastRawEv`
+和 `evKnown`），`computedKnown()` 改读 `evKnown`。
+
+**顺手修的同类问题**：`updateCombo()` 原来只在「下标变了」时才写 label，一旦某轮超范围把 label
+写成了空白档，回到范围内但下标恰好没变，空白就一直留在屏幕上。改成每次都无条件对齐 label。
+
+**教训（通用）**：ArkUI 里**凡是要驱动 UI（尤其 `if` 分支、显隐、颜色）的值，必须是
+`@State`/`@Prop` 这类可观察状态**。普通成员变量只适合放在逻辑里；一旦进了 `build()`，
+它变化时 UI 会静默不刷新，而且不报错、不告警，最难查。
+
+**验证手法**（这次就是这么定位的）：
+1. 装旧包（`release/` 里那个）→ 冷启动 → 直接锁定 → 截图，复现 XX；
+2. 装新包 → 同样的动作 → 快门出数；
+3. `hdc shell "hilog -x | grep 'LOCK'"` 里有一条
+   `[LOCK] measure done ev=5.2 ap=f/1.6 sh=1/15 known=true evKnown=true oob=false`，
+   能直接看出「状态算对了、只是没画出来」。
+
+### 4.10 全屏浮层：`HitTestMode.Block` 会把自己的子节点一起屏蔽
+
+做设置页时踩到：整页浮层用 `Column(){ …内容… }.hitTestBehavior(HitTestMode.Block)` 想挡住下面主界面，
+结果**页内的卡片、返回按钮全都点不动**。
+
+`HitTestMode` 四种取值的实际含义：
+
+| 取值 | 自身 | 子节点 | 兄弟节点 |
+|---|---|---|---|
+| Default | 响应 | 响应 | 不阻塞 |
+| **Block** | 响应 | **不响应** | 阻塞 |
+| Transparent | 不响应 | 响应 | 不阻塞 |
+| None | 不响应 | 不响应 | 不阻塞 |
+
+正确写法是**两层**：底层放一个空 `Column()` 铺满、背景色 + `Block` 用来吃掉漏下来的触摸，
+上层正常放内容（Default），再给内容根节点挂个空 `onClick(() => {})` 兜住空白处的点击。
+这样既挡住主界面，页内按钮也照常能点（实测：设置页空白处正下方就是「锁定曝光」，点了不会误触）。
+
+### 4.11 `Path` 的 commands 单位是 px，不是 vp
+
+想用 `Path().commands(...)` 手绘图标时踩到：按 20vp 画布生成的坐标，塞进 `.width(20).height(20)`
+的 `Path` 里，实际只画出 ~5.7vp 大的一小坨，还贴在左上角——因为 **`Path` 的 commands 坐标按 px 解释**，
+而组件尺寸是 vp。密度 3.5 的机器上差三倍多。
+
+两条路都行：
+
+- **矢量资源**（本项目选的）：`resources/base/media/xxx.svg` + `Image($r('app.media.xxx'))`，
+  按组件尺寸缩放，密度无关，还能用 `.fillColor()` 改色；
+- 或者用 `Shape().viewPort({ x:0, y:0, width:20, height:20 })` 把坐标系映射过去。
+
+顺带一条：**别用文本字符当图标**（「⚙」「设置」这种），字形随系统字体变，字号也不受控。
+
+### 4.12 `setZoomRatio` 是异步的，别紧跟着拍照
+
+兼容模式首启要「调到最广角 → 拍一张读光圈」，一开始写成连续调用，结果：`setZoomRatio(0.55)` 之后
+10ms 就 capture，读到的还是主摄的 **f/2.0 / 5.8mm**（应当读到超广角的 f/2.2 / 1.8mm），
+随后又因为两次 capture 间隔 <500ms 被拒 **7400102**。
+
+正确顺序：下发倍率 → `sleep(~900ms)`（实测约 1 秒才真正切到超广角）→（首次还要 warmUp）→
+`sleep(600ms)` → capture → 失败最多重试 3 次。
+日志里 `[COMPAT] hw zoom before aperture read = 0.55x (want 0.55)` 就是用来确认倍率到位没有。
+
 ---
 
 ## 5. 已知问题与限制
 
-1. **EV 未与真实测光表比对**：建议下一版用 18% 灰卡或已知 EV 场景标定一次「校准 EV」。
-2. **光圈硬编码 f/2.2**：测试机型上读不到；换机型需重测。
-3. **矩阵模式是简单平均**，没有做中心加权（真实相机的多分区测光会加权）。
-4. **锁定后切后台恢复的是"重建时重新冻结的那一帧"**，不是切走前那一帧（原帧随相机释放丢失）。
-5. **长曝光只做了标红提示**，没有做倒易律补偿计算。
-6. **测光稳定性**：AE 未收敛时读数会跳；目前靠"连续两次相同才显示稳定"粗略处理，没有接 `ExposureState`（API 26 有 `CONVERGED` 回调）。
-7. **只在 MRT-AL10 验证过**，其他机型/系统版本未测试。
+1. **EV 未与真实测光表比对**：建议用 18% 灰卡或已知 EV 场景标定一次「校准 EV」。
+2. **光圈只能靠 EXIF**：本机 API 恒 0（§9.1）。兼容模式下光圈是首启读到的常量，换机型/换镜头不会更新，
+   要重读得清掉 preferences 里的 `compatAperture`。
+3. **矩阵测光在兼容模式下是近似**：取景框裁切后，我们只统计可见区域（§9.14），但相机的 AE 仍按整帧
+   做矩阵测光，所以「AE 的曝光基准」和「我们平均的区域」不完全一致；点测模式因为 AE 点会跟着走，反而更准。
+4. **兼容模式画质差**：显示 5x 时实际裁切约 9 倍，画面糊是固有的（假变焦的定义）。
+5. **矩阵模式是简单平均**，没有做中心加权（真实相机的多分区测光会加权）。
+6. **锁定后切后台恢复的是"重建时重新冻结的那一帧"**，不是切走前那一帧（原帧随相机释放丢失）。
+7. **长曝光只做了标红提示**，没有做倒易律补偿计算。
+8. **测光稳定性**：AE 未收敛时读数会跳；目前靠"连续两次相同才显示稳定"粗略处理，
+   没有接 `ExposureState`（API 26 有 `CONVERGED` 回调）。
+9. **只在 MRT-AL10 验证过**，其他机型/系统版本未测试。
 
 ---
 
@@ -251,8 +342,8 @@ this.safeBottom = px2vp(nav.bottomRect.height);
 
 1. **接 AE 收敛状态再读数**：`exposureStateChange`（API 26）收敛后再采样，读数会稳很多，改动很小。
 2. **灰卡标定流程**：界面上引导用户"把灰卡放进取景框 → 点标定 → 自动算 biasEv 存下来"，比手动调滚轮靠谱。
-3. **真 zoom 实验**：把硬件 `zoomRatio` 放开给滑条（同时要删掉 `readOnce` 里那句每 400ms 把 zoom 拉回 0.8 的防御代码，否则拖动无效），实测不同焦段的光圈与视场变化，再决定是否替换裁切放大。
-4. **矩阵测光中心加权**：中间 4×4 分区权重 2.0，边缘 1.0，比现在简单平均更接近相机行为。
+3. **矩阵测光中心加权**：中间 4×4 分区权重 2.0，边缘 1.0，比现在简单平均更接近相机行为。
+4. **兼容模式的矩阵口径**：把相机 AE 也切成点测/锁定，或用 AE 补偿把基准拉回可见区域（§5 第 3 条）。
 5. **多点记忆**：存高光/阴影两个读数，显示动态范围估值。
 6. **长曝光倒易律补偿**：按胶片型号查表（如 Provia/T-Max）给出补偿后的快门。
 
@@ -503,3 +594,71 @@ $HDC shell uitest uiInput click 640 1200              # 点击 / longClick / swi
   按焦段查表会把推断错误固化进数据，宁可一直定时实拍。
 - 快门声/拍照对 AE 的影响未在真机上听/测过，若 0.5s 轮询有快门声，需要改成「变焦停稳后再拍」。
 - 变焦时预览有小卡顿（用户已确认可接受，暂不优化）。
+
+### 9.13 设置页与「变焦模式」选项（代码在仓库，尚未发版）
+
+- **入口**：主界面右上角一个**齿轮图标**（36vp 半透明圆底 + 21vp 白色齿轮）。图标是矢量资源
+  `entry/src/main/resources/base/media/ic_settings_gear.svg`（8 齿、中心孔靠 nonzero 反向绕行挖空），
+  用 `Image($r('app.media.ic_settings_gear')).fillColor('#E8FFFFFF')` 上色，换尺寸不失真。
+  没走 `router` / `Navigation` 新路由，而是主页面 `Stack()` 里的**整页浮层**（`showSettings`），
+  这样不用再配一套全屏窗口与安全区。
+- **位置**：浮在预览右侧那条黑色留白里。不要改成顶部一整行 —— 页面已经很挤，加 40vp 的顶栏
+  会把底部状态文字顶出屏幕（没有 Scroll，会被裁掉）。
+- **页面**：`Index.ets` 的 `@Builder settingsPage()`；返回用页内「‹ 返回」，系统返回键由
+  `onBackPress()` 接管（设置页开着时只关页面、不退应用，已实测）。
+- **选项**：`zoomMode` = `normal`（普通模式，现在的真变焦）/ `compat`（兼容模式，v1.1 的裁切放大）。
+  选择立即写入 preferences 的 `zoomMode` 键，重启后保持（已实测）。
+- 浮层的点击拦截写法见 §4.10（`HitTestMode.Block` 的坑）。
+
+### 9.14 兼容模式（裁切假变焦）实现
+
+普通模式不变，兼容模式是 v1.1 那套「相机钉死 + 裁切放大」的重做：
+
+- **相机倍率钉在最小值**：`initZoomRange` 首启读到的 `zoomMin`（本机 0.55x 超广角，存 preferences），
+  兼容模式下所有下发都走 `hwZoomOf()` → 永远返回 `zoomMin`，滑条不再驱动相机。
+- **滑条范围 `zoomMin ~ 5x`**（显示倍率 = 等效视场倍数）。上限是常量 `COMPAT_MAX_ZOOM = 5`：
+  5x 时实际裁切 5 / 0.55 ≈ **9.1 倍**，画面会明显糊。
+  如果原意是「裁切倍数最多 5」，把上限改成 `zoomMin * 5` 即可（显示区间就变成 0.55x ~ 2.75x）。
+- **启动倍率**：没锁焦段时落在 **1.0x**（和普通模式一样，等效 24mm；此时裁切 1/0.55 ≈ 1.8 倍，**不是**贴在最广角）；
+  锁了焦段就按存下来的毫米数换算（实测锁 45mm → 重启仍是 1.9x·45mm，滑条保持禁用手感）。
+  换算统一走 `compatDefaultRatio()`，切模式时也用同一条规则。
+- **画面**：`XComponent.scale(crop)` + 外层 `.clip(true)`，`crop = 显示倍率 / zoomMin`；滑条拖动时
+  每 60ms 的插值照旧跑（只改裁切、不碰相机），点轨道跳档时裁切即时生效、settle 缩到 150ms。
+- **光圈只读一次**：首启（preferences 里还没有 `compatAperture` 时）把 zoom 调到最小 →
+  等 900ms 让 `setZoomRatio` 真正生效 → 拍一张读 EXIF → 存 `compatAperture` / `compatFocal`。
+  之后每次启动直接读缓存，**不再拍照**（实测第二次启动的日志里没有任何 capture）。
+  1.0x 的焦距标定在兼容模式下跳过，改用这张照片的 `FocalLengthIn35mmFilm` 反推 `baseFocal35`。
+- **测光跟着裁切走**（需求 5）：点测的圆心与半径、矩阵的 12×16 窗口、以及传给相机的 AE 测光点，
+  全部换算到「画面正中 1/crop 那一块」里 —— 否则算的是取景框外、用户看不到的内容。
+  换算形式（crop=1 时退化成原公式）：
+  `cx = w*(0.5 + (meterY-0.5)/crop)`、`cy = h*(0.5 + (0.5-meterX)/crop)`、`ringR, refR /= crop`。
+- **切模式即时生效**：normal→compat 把相机钉回最小、显示倍率拉回最小；compat→normal 把当前显示倍率
+  重新下发相机（视场保持一致）。
+- 兼容模式变焦期间照旧「停测光」，但不补拍光圈（改用常量），所以 settle 后直接 `readOnce()`。
+
+### 9.15 代码清理（未发版，行为不变）
+
+改动前做了完整备份：工作区 `tmp/backup/` 下有 `DSH-Meter-src-before-optimize-*.tar.gz`、
+`pre-optimize-*.patch`（未提交改动）与哈希清单；优化后另存一份 `optimized-*`。
+
+- 删掉一批从没被引用的成员：`meterModeText`、`showIso/showCalib/showExp`、`longExposure`、
+  `pressStartMs/X/Y`、`DEBUG_EXIF`、`logZoomLag()`、`computedOutOfRange()`（共约 40 行）。
+- 点测圈比例 `ringRatioCache`：原来 `computeSample()` / `remeter()` **每帧**都调
+  `display.getDefaultDisplaySync()` + `vp2px()`，现在算一次缓存（屏幕尺寸运行中不变）。
+- `sampleFrame()` 一帧只建一次 `Uint8Array` 视图，亮度统计与快照共用。
+- `saveSnapshot()` 改成「每行算一次上界」，去掉逐像素的 `length` 比较；
+  用 Python 对 200 组随机 (w, h, stride, 截断长度) 做了新旧实现一致性 fuzz，**0 差异**。
+
+
+### 9.16 发布记录：v1.2.1（2026-10-24）
+
+- 版本号：`1.2.1` / `1020001`（`AppScope/app.json5`）。
+- 产物：`release/qing-ce-guang-v1.2.1.hap`，**673,283 B**，
+  SHA256 `c1fe8051f21372c46780a8da280ee54b5fe249b3d1541d30db977cb9fa75cdaa`（调试证书签名）。
+- 本版内容：设置页 + 兼容模式（§9.13 / §9.14）、锁定 XX 遮罩修复（§4.9）、
+  全屏浮层点击修复（§4.10）、图标改 SVG（§4.11）、兼容模式读光圈时序（§4.12）、代码清理（§9.15）。
+- 上传注意（沿用 v1.2.0 的教训）：
+  - **asset 名必须 ASCII**：`qing-ce-guang-v1.2.1.hap`，中文名会被 GitHub 吞掉；
+  - Release 正文注明「作者调试证书签名，其它设备请自行签名构建」；
+  - tag 用 `v1.2.1`，与 `versionName` 对齐；tag 与 Release 都要打，`git push --tags` 别忘。
+- 验证：release 包装到 MRT-AL10，启动 ~0.7s、兼容模式 1.0x 正常、锁定出数（EV 6.1 / f/2 / 1/20）。

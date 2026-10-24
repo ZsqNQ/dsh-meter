@@ -186,8 +186,13 @@ struct Index {
   @State safeBottom: number = 0;
   @State evText: string = '--';
   @State statusText: string = '初始化…';
-  @State meterModeText: string = '--';
   @State locked: boolean = false;
+  /**
+   * 「算出来的那一侧」是否已有有效读数。
+   * 必须是 @State：它决定 XX 遮罩的 if 分支，之前用普通字段 lastRawEv 判断，
+   * 冷启动后第一次锁定/测光时遮罩的 if 不会重算 → EV 出来了、快门/光圈还盖着 XX。
+   */
+  @State evKnown: boolean = false;
 
   // 原生变焦：zoomMin/zoomMax 来自设备（首启读一次存 preferences），zoomPos 是滑条位置 0~1000
   @State zoomMin: number = 0.55;
@@ -215,7 +220,13 @@ struct Index {
   // 胶片 ISO
   @State filmIso: number = 100;
   @State isoIndex: number = 12;
-  @State showIso: boolean = false;
+  /** 设置页是否打开（整页浮层，盖住主界面） */
+  @State showSettings: boolean = false;
+  /** 变焦模式：'normal' 真变焦 | 'compat' 裁切放大（硬件 zoom 钉在最小值） */
+  @State zoomMode: string = 'normal';
+  /** 兼容模式的固定光圈 / 物理焦距（首启拍一张读到后存 preferences，之后不再拍） */
+  @State compatAp: number = 0;
+  @State compatFocal: number = 0;
 
   // 曝光组合：apLocked=true 表示 A 档（锁光圈），false 表示 S 档（锁快门）
   @State apLocked: boolean = true;
@@ -223,15 +234,12 @@ struct Index {
   @State shIndex: number = 20;
   @State apLabel: string = 'f/5.6';
   @State shLabel: string = '1/125';
-  @State longExposure: boolean = false;
   @State outOfRange: boolean = false;
 
   // 校准 / 曝光补偿
   @State biasEv: number = 0;
-  @State showCalib: boolean = false;
   @State calibIndex: number = 50;
   @State expEv: number = 0;
-  @State showExp: boolean = false;
   @State expIndex: number = 50;
 
   /** 纯档位列表（用户自己滚的那一侧用，没有空白项） */
@@ -252,9 +260,6 @@ struct Index {
   private surfaceId: string = '';
 
   private activeDialog: CustomDialogController | undefined = undefined;
-  private pressStartMs: number = 0;
-  private pressStartX: number = 0;
-  private pressStartY: number = 0;
 
   private aeDurationUs: number = 0;
   private aeIso: number = 0;
@@ -279,6 +284,8 @@ struct Index {
   private frameSnapshot: Uint8Array | undefined = undefined;
   private snapW: number = 0;
   private snapH: number = 0;
+  /** 点测圈半径 / 预览宽度 的比例：屏幕尺寸固定，算一次缓存（原来每帧都查屏幕再 vp2px） */
+  private ringRatioCache: number = 0;
   private enableAnalyzer: boolean = true;
   private device: camera.CameraDevice | undefined = undefined;
   private apMonitor: ApertureMonitor = new ApertureMonitor();
@@ -329,8 +336,15 @@ struct Index {
   /** 焦距锁与锁定的毫米数（重启后恢复） */
   private static readonly PREF_ZOOM_LOCK: string = 'zoomLock';
   private static readonly PREF_ZOOM_MM: string = 'zoomLockMm';
-  /** EXIF 探针：静默拍低分辨率照片读光圈/等效焦距 */
-  private static readonly DEBUG_EXIF: boolean = false;
+  /** 变焦模式：normal = 真变焦（默认），compat = 裁切放大（v1.1 的假变焦） */
+  private static readonly PREF_ZOOM_MODE: string = 'zoomMode';
+  private static readonly MODE_NORMAL: string = 'normal';
+  private static readonly MODE_COMPAT: string = 'compat';
+  /** 兼容模式最多放到 5x（显示倍率，等于等效视场；硬件钉在变焦最小值上） */
+  private static readonly COMPAT_MAX_ZOOM: number = 5;
+  /** 兼容模式首启拍照读到的固定光圈 / 物理焦距，存下来后不再拍 */
+  private static readonly PREF_COMPAT_AP: string = 'compatAperture';
+  private static readonly PREF_COMPAT_FOCAL: string = 'compatFocal';
 
   /** 算出来那一侧的空白档：首尾各一个，用不同的不可见字符区分，避免 value 绑定撞车 */
   private static readonly BLANK_TOP: string = ' ';
@@ -449,7 +463,18 @@ struct Index {
 
       const mode = await store.get(Index.PREF_METER, 'spot') as string;
       this.meterMode = mode === 'matrix' ? 'matrix' : 'spot';
-      this.meterModeText = this.meterMode === 'matrix' ? '矩阵测光' : '点测光';
+
+      const zm = await store.get(Index.PREF_ZOOM_MODE, Index.MODE_NORMAL) as string;
+      this.zoomMode = zm === Index.MODE_COMPAT ? Index.MODE_COMPAT : Index.MODE_NORMAL;
+      const cap = await store.get(Index.PREF_COMPAT_AP, 0) as number;
+      if (typeof cap === 'number' && Number.isFinite(cap) && cap > 0) {
+        this.compatAp = cap;
+      }
+      const cfocal = await store.get(Index.PREF_COMPAT_FOCAL, 0) as number;
+      if (typeof cfocal === 'number' && Number.isFinite(cfocal) && cfocal > 0) {
+        this.compatFocal = cfocal;
+      }
+      console.info(`[SETTINGS] zoomMode=${this.zoomMode} compatAp=${this.compatAp}`);
 
       const ap = await store.get(Index.PREF_AP, this.apIndex) as number;
       if (ap >= 0 && ap < APERTURE_LADDER.length) {
@@ -522,9 +547,11 @@ struct Index {
           console.error('[ZOOM] device reported no usable range, locked to 1x');
         }
       }
-      const target: number = applyDefault ? Index.DEFAULT_ZOOM : this.zoomRatio;
-      this.zoomRatio = Math.min(this.zoomMax, Math.max(this.zoomMin, target));
-      this.zoomPos = zoomToSliderPos(this.zoomRatio, this.zoomMin, this.zoomMax);
+      // 兼容模式：没锁焦段时和普通模式一样默认 1.0x，锁了焦段就回到锁定的那一档
+      const def: number = this.isCompat() ? this.compatDefaultRatio() : Index.DEFAULT_ZOOM;
+      const target: number = applyDefault ? def : this.zoomRatio;
+      this.zoomRatio = Math.min(this.zoomUiMax(), Math.max(this.zoomMin, target));
+      this.zoomPos = zoomToSliderPos(this.zoomRatio, this.zoomMin, this.zoomUiMax());
       console.info(`[ZOOM] ${applyDefault ? 'default' : 'resume'} ${this.zoomRatio} pos=${this.zoomPos} ` +
         `cached=${this.zoomCached} min=${this.zoomMin} max=${this.zoomMax}`);
     } catch (e) {
@@ -534,19 +561,81 @@ struct Index {
     }
   }
 
+  // ---------------- 变焦模式（普通 = 真变焦 / 兼容 = 裁切放大） ----------------
+
+  private isCompat(): boolean {
+    return this.zoomMode === Index.MODE_COMPAT;
+  }
+
+  /** 滑条与换算用的倍率上限：兼容模式锁到 5x（显示倍率 = 等效视场倍数） */
+  private zoomUiMax(): number {
+    return this.isCompat() ? Math.min(Index.COMPAT_MAX_ZOOM, this.zoomMax) : this.zoomMax;
+  }
+
+  /**
+   * 兼容模式的裁切倍数（1 = 不裁）。
+   * 硬件钉在最小倍率（超广角），显示倍率与它的比值就是画面要放大的倍数。
+   */
+  private cropScale(): number {
+    if (!this.isCompat() || !(this.zoomMin > 0) || !(this.zoomRatio > 0)) {
+      return 1;
+    }
+    return Math.max(1, this.zoomRatio / this.zoomMin);
+  }
+
+  /** 真正下发给相机的倍率：兼容模式永远钉在变焦最小值上 */
+  private hwZoomOf(ratio: number): number {
+    return this.isCompat() ? this.zoomMin : ratio;
+  }
+
+  /**
+   * 兼容模式启动时的显示倍率：
+   *   - 没锁焦段 → 1.0x（和普通模式一样，等效 24mm）；
+   *   - 锁了焦段 → 用存下来的毫米数换算，下次启动停在同一焦段。
+   */
+  private compatDefaultRatio(): number {
+    let ratio: number = 1.0;
+    if (this.zoomLocked && this.pendingLockMm > 0 && this.baseFocal35 > 0) {
+      ratio = this.pendingLockMm / this.baseFocal35;
+    }
+    return Math.min(this.zoomUiMax(), Math.max(this.zoomMin, ratio));
+  }
+
+  /** EV 用的光圈：兼容模式用「首启读一次存下来」的常量，普通模式走 0.5s 轮询 */
+  private meteringAperture(): number {
+    if (this.isCompat() && this.compatAp > 0) {
+      return this.compatAp;
+    }
+    return this.apMonitor.aperture();
+  }
+
+  /** 光圈文案：兼容模式是常量，普通模式由 ApertureMonitor 回调维护 */
+  private updateApText(): void {
+    if (!this.isCompat()) {
+      return;
+    }
+    if (this.compatAp > 0) {
+      this.apText = `兼容模式 · 固定光圈 f/${this.compatAp.toFixed(1)}` +
+        (this.compatFocal > 0 ? ` · 物理焦距 ${this.compatFocal.toFixed(1)}mm` : '');
+    } else {
+      this.apText = '兼容模式 · 光圈读取中…';
+    }
+  }
+
   /** 真正下发给相机会话；失败不改状态，避免 UI 和相机的倍率对不上 */
   private applyZoom(ratio: number): void {
-    const clamped: number = Math.min(this.zoomMax, Math.max(this.zoomMin, ratio));
+    const clamped: number = Math.min(this.zoomUiMax(), Math.max(this.zoomMin, ratio));
     this.zoomRatio = clamped;
     const s = this.session;
     if (!s) {
       return;
     }
+    const hw: number = this.hwZoomOf(clamped);
     try {
-      s.setZoomRatio(clamped);
-      console.info(`[ZOOM] apply ${clamped.toFixed(2)}x`);
+      s.setZoomRatio(hw);
+      console.info(`[ZOOM] apply ${clamped.toFixed(2)}x (hw ${hw.toFixed(2)}x)`);
     } catch (e) {
-      console.error(`[ZOOM] setZoomRatio(${clamped}) failed ${(e as BusinessError).code}`);
+      console.error(`[ZOOM] setZoomRatio(${hw}) failed ${(e as BusinessError).code}`);
     }
   }
 
@@ -557,6 +646,10 @@ struct Index {
    */
   /** 拖动中的每一步：直接设倍率，立即生效（系统平滑变焦本机固定 433ms，连续重定向会滞后半秒） */
   private applyZoomDirect(ratio: number): void {
+    if (this.isCompat()) {
+      // 兼容模式只改裁切，相机倍率不动
+      return;
+    }
     const clamped: number = Math.min(this.zoomMax, Math.max(this.zoomMin, ratio));
     const s = this.session;
     if (!s || this.locked || this.zoomLocked) {
@@ -570,6 +663,10 @@ struct Index {
   }
 
   private applyZoomSmooth(ratio: number): void {
+    if (this.isCompat()) {
+      // 兼容模式没有相机过渡可走，裁切是即时的
+      return;
+    }
     const clamped: number = Math.min(this.zoomMax, Math.max(this.zoomMin, ratio));
     const s = this.session;
     if (!s) {
@@ -614,7 +711,8 @@ struct Index {
    * 只在 preferences 里没有基准时跑一次，之后永远用缓存。
    */
   private async calibrateBaseFocal35(): Promise<void> {
-    if (this.baseFocal35 > 0 || this.locked || this.meteringOn) {
+    if (this.baseFocal35 > 0 || this.locked || this.meteringOn || this.isCompat()) {
+      // 兼容模式硬件钉在最小值，不做 1.0x 标定（等效焦距由首启那张照片反推，见 deriveBaseFocal35）
       return;
     }
     try {
@@ -691,11 +789,11 @@ struct Index {
     if (!(this.baseFocal35 > 0) || !(mm > 0)) {
       return;
     }
-    const ratio: number = Math.min(this.zoomMax, Math.max(this.zoomMin, mm / this.baseFocal35));
+    const ratio: number = Math.min(this.zoomUiMax(), Math.max(this.zoomMin, mm / this.baseFocal35));
     this.zoomTarget = ratio;
     this.zoomAnim = ratio;
     this.zoomRatio = ratio;
-    this.zoomPos = zoomToSliderPos(ratio, this.zoomMin, this.zoomMax);
+    this.zoomPos = zoomToSliderPos(ratio, this.zoomMin, this.zoomUiMax());
     this.applyZoom(ratio);
   }
 
@@ -709,12 +807,19 @@ struct Index {
   }
 
   private onZoomSlider(v: number, mode: SliderChangeMode): void {
-    this.zoomTarget = sliderPosToZoom(v, this.zoomMin, this.zoomMax);
+    this.zoomTarget = sliderPosToZoom(v, this.zoomMin, this.zoomUiMax());
     this.beginZooming();
 
     if (mode === SliderChangeMode.Click) {
       // 点轨道跳档：这里才用系统的平滑变焦（本机固定 433ms 过渡），一次性动画，不用跟手
       this.zoomAnim = this.zoomTarget;
+      if (this.isCompat()) {
+        // 兼容模式裁切即时生效，不用等相机过渡
+        this.zoomRatio = this.zoomTarget;
+        this.applyZoomSmooth(this.zoomTarget);
+        this.scheduleZoomSettle(150);
+        return;
+      }
       this.applyZoomSmooth(this.zoomTarget);
       this.scheduleZoomSettle(700);
       return;
@@ -846,11 +951,6 @@ struct Index {
       `analyze=${this.rateText(this.analyzeOutput)}`);
   }
 
-  /** 算出来的那一侧超出档位表（所需值比最快还快 / 比最慢还慢） */
-  private computedOutOfRange(): boolean {
-    return this.computedKnown() && this.outOfRange;
-  }
-
   /** 算出来的那一侧（A 档的快门 / S 档的光圈）是否有确定值 */
   private computedKnown(): boolean {
     if (this.zooming) {
@@ -859,7 +959,14 @@ struct Index {
     if (!(this.meteringOn || this.locked)) {
       return false;
     }
-    return this.lastRawEv > 0;
+    // 用 @State 的 evKnown，别用普通字段 lastRawEv：后者变了不会触发 XX 遮罩重算
+    return this.evKnown;
+  }
+
+  /** 唯一的 EV 写入口：顺带更新 @State 的 evKnown，保证 XX 遮罩能跟着刷新 */
+  private setRawEv(v: number): void {
+    this.lastRawEv = v;
+    this.evKnown = v > 0;
   }
 
   private sleepMs(ms: number): Promise<void> {
@@ -940,21 +1047,24 @@ struct Index {
     this.meteringOn = true;
     this.statusText = '测光中…';
     this.setAnalyzerStream(true);
-    this.apMonitor.setPollInterval(400);
-    setTimeout(() => {
-      if (!this.meteringOn) {
-        return;
-      }
-      if (this.apMonitor.isWarmed()) {
-        this.apMonitor.startPolling();
-      } else {
-        this.apMonitor.warmUp().then(() => {
-          if (this.meteringOn) {
-            this.apMonitor.startPolling();
-          }
-        });
-      }
-    }, 180);
+    if (!this.isCompat()) {
+      // 兼容模式光圈是常量、不用轮询拍照，只要取帧算亮度
+      this.apMonitor.setPollInterval(400);
+      setTimeout(() => {
+        if (!this.meteringOn) {
+          return;
+        }
+        if (this.apMonitor.isWarmed()) {
+          this.apMonitor.startPolling();
+        } else {
+          this.apMonitor.warmUp().then(() => {
+            if (this.meteringOn) {
+              this.apMonitor.startPolling();
+            }
+          });
+        }
+      }, 180);
+    }
     this.readOnce();
     console.info('[METER] live start');
   }
@@ -1004,6 +1114,22 @@ struct Index {
   /** 启动阶段的热机 + 首启焦距标定 */
   private async runStartupWarmup(): Promise<void> {
     try {
+      if (this.isCompat()) {
+        // 兼容模式：硬件钉在变焦最小值，光圈只在首启拍一张读出来，之后启动不再拍
+        this.warmAndCalibDone = true;
+        this.maybeFinishBoot();
+        // 硬件钉在最小值，但显示倍率保持启动时定下的（没锁焦段 = 1.0x，锁了就按锁定的毫米数）
+        this.applyZoom(this.zoomRatio);
+        this.zoomTarget = this.zoomRatio;
+        this.zoomAnim = this.zoomRatio;
+        this.zoomPos = zoomToSliderPos(this.zoomRatio, this.zoomMin, this.zoomUiMax());
+        // 设置可能比相机会话后到，这里再兜一次「锁定的焦段」（幂等）
+        if (this.zoomLocked && this.pendingLockMm > 0 && this.baseFocal35 > 0) {
+          this.applyFocalMm(this.pendingLockMm);
+        }
+        await this.ensureCompatAperture();
+        return;
+      }
       if (this.baseFocal35 === 0 && !this.locked && !this.meteringOn) {
         // 首启：标定本身就要连拍几张，等于同时把管道热起来了，不用再多一次空拍
         await this.calibrateBaseFocal35();
@@ -1030,26 +1156,81 @@ struct Index {
     }
   }
 
-  /** 拖动中每隔 300ms 打一次「目标倍率 vs 相机实际倍率」，用来量化跟手程度 */
-  private logZoomLag(): void {
-    const now: number = Date.now();
-    if (now - this.lastZoomProbeMs < 300) {
+  /**
+   * 兼容模式的光圈：只读一次。
+   * 硬件已钉在变焦最小值（超广角），光圈不会再变，所以首启拍一张读 EXIF 存进 preferences，
+   * 之后每次启动直接用缓存，不再拍照（也不用 0.5s 轮询）。
+   */
+  private async ensureCompatAperture(): Promise<void> {
+    if (this.compatAp > 0) {
+      this.updateApText();
       return;
     }
-    this.lastZoomProbeMs = now;
     const s = this.session;
     if (!s) {
       return;
     }
-    let actual: number = -1;
     try {
-      actual = s.getZoomRatio();
+      // setZoomRatio 是异步的（实测要 ~1 秒才真正切到超广角），等它到位再拍，
+      // 否则会读到主摄的 f/2.0（物理焦距 5.8mm），光圈就固定错了
+      await this.sleepMs(900);
+      let actual: number = 0;
+      try {
+        actual = s.getZoomRatio();
+      } catch (e) {
+        actual = -1;
+      }
+      console.info(`[COMPAT] hw zoom before aperture read = ${actual}x (want ${this.zoomMin})`);
+
+      for (let i = 0; i < 3 && this.compatAp <= 0; i++) {
+        if (!this.apMonitor.isWarmed()) {
+          await this.apMonitor.warmUp();
+        }
+        // 两次 capture 至少隔 500ms，否则相机直接拒（7400102）
+        await this.sleepMs(600);
+        await this.apMonitor.shootNow();
+        const r: ApReading | undefined = this.apMonitor.reading();
+        if (r === undefined) {
+          console.error(`[COMPAT] aperture read empty (try ${i + 1})`);
+          continue;
+        }
+        this.compatAp = r.aperture;
+        this.compatFocal = r.focal;
+        this.savePref(Index.PREF_COMPAT_AP, r.aperture);
+        this.savePref(Index.PREF_COMPAT_FOCAL, r.focal);
+        this.deriveBaseFocal35(r);
+        console.info(`[COMPAT] fixed aperture f/${r.aperture} focal=${r.focal}mm ` +
+          `f35=${r.focal35} zoom=${this.zoomMin}`);
+      }
+      if (this.compatAp <= 0) {
+        console.error('[COMPAT] aperture read failed, fallback f/2.2');
+      }
     } catch (e) {
-      actual = -1;
+      console.error(`[COMPAT] aperture read error E${(e as BusinessError).code}`);
     }
-    const err: number = actual > 0 ? Math.log2(actual / this.zoomRatio) : 0;
-    console.info(`[ZOOM] target=${this.zoomRatio.toFixed(2)} actual=${actual.toFixed(2)} ` +
-      `lag=${err.toFixed(2)}stop`);
+    this.updateApText();
+    this.refreshDisplay();
+  }
+
+  /**
+   * 兼容模式跳过 1.0x 的焦距标定（硬件钉在最小值），
+   * 用同一张照片的 FocalLengthIn35mmFilm 反推「1x 等效焦距」，界面上的 mm 才不会空着。
+   */
+  private deriveBaseFocal35(r: ApReading): void {
+    if (this.baseFocal35 > 0 || !(r.focal35 > 0) || !(this.zoomMin > 0)) {
+      return;
+    }
+    const base: number = Math.round(r.focal35 / this.zoomMin);
+    if (base < 12 || base > 100) {
+      return;
+    }
+    this.baseFocal35 = base;
+    this.savePref(Index.PREF_BASE_F35, base);
+    console.info(`[COMPAT] base f35@1x≈${base}mm (from ${r.focal35}mm @ ${this.zoomMin}x)`);
+    // 首启就锁着焦段的情况：基准刚算出来，把锁定的毫米数补上
+    if (this.zoomLocked && this.pendingLockMm > 0) {
+      this.applyFocalMm(this.pendingLockMm);
+    }
   }
 
   /**
@@ -1091,6 +1272,8 @@ struct Index {
       this.scheduleZoomSettle(120);
       return;
     }
+    // 兼容模式的裁切变了，给相机的测光点也要跟着挪
+    this.updateMeterPoint();
     if (this.locked) {
       // 锁定态不拍照（session 已停），直接用锁定帧重算，避免 EV 卡在 XX
       this.zooming = false;
@@ -1108,6 +1291,13 @@ struct Index {
       return;
     }
     // 补测期间继续显示 XX：等这张 EXIF 回来才算测光恢复，否则会先拿旧光圈显示一帧
+    if (this.isCompat()) {
+      // 兼容模式光圈是常量，变焦只是裁切，不用补拍
+      this.zooming = false;
+      this.readOnce();
+      console.info('[ZOOM] compat zoom settled');
+      return;
+    }
     this.statusText = '补测…';
     await this.apMonitor.shootNow();
     this.zooming = false;
@@ -1126,6 +1316,7 @@ struct Index {
     this.savePref(Index.PREF_AP, this.apIndex);
     this.savePref(Index.PREF_SH, this.shIndex);
     this.savePref(Index.PREF_ZOOM_LOCK, this.zoomLocked);
+    this.savePref(Index.PREF_ZOOM_MODE, this.zoomMode);
     const curMm: number = this.baseFocal35 > 0 ? Math.round(this.baseFocal35 * this.zoomRatio) : 0;
     this.savePref(Index.PREF_ZOOM_MM, this.zoomLocked ? curMm : 0);
     console.info(`[SETTINGS] state saved A=${this.apLocked} ap=${this.apIndex} sh=${this.shIndex}`);
@@ -1183,6 +1374,15 @@ struct Index {
     this.shutdown();
   }
 
+  /** 系统返回：设置页开着就先退出设置页，别直接退应用 */
+  onBackPress(): boolean {
+    if (this.showSettings) {
+      this.closeSettings();
+      return true;
+    }
+    return false;
+  }
+
   private shutdown(): void {
     this.apMonitor.stopAll();
     if (this.timer !== -1) {
@@ -1221,6 +1421,8 @@ struct Index {
           XComponent({ id: 'preview', type: XComponentType.SURFACE, controller: this.xController })
             .width('100%')
             .height('100%')
+            // 兼容模式：硬件倍率不动，靠居中放大 + 外层 clip 实现「假变焦」
+            .scale({ x: this.cropScale(), y: this.cropScale() })
             .onLoad(() => {
               try {
                 this.xController.setXComponentSurfaceRotation({ lock: true });
@@ -1600,6 +1802,38 @@ struct Index {
       .padding({ top: this.safeTop, bottom: this.safeBottom })
       .backgroundColor('#101010')
 
+      // 右上角：设置入口（齿轮图标）。浮在预览右侧的黑色留白里，不占布局高度
+      // （页面已经很挤，加一行 40vp 的顶栏会把底部状态文字顶出屏幕）
+      if (!this.booting) {
+        Column() {
+          Stack() {
+            Image($r('app.media.ic_settings_gear'))
+              .width(21)
+              .height(21)
+              .fillColor('#E8FFFFFF')
+              .draggable(false)
+          }
+          .width(36)
+          .height(36)
+          .backgroundColor('#1AFFFFFF')
+          .borderRadius(18)
+          .onClick(() => {
+            this.openSettings();
+          })
+        }
+        .width('100%')
+        .height('100%')
+        .alignItems(HorizontalAlign.End)
+        .justifyContent(FlexAlign.Start)
+        .padding({ top: this.safeTop + 8, right: 8 })
+        .hitTestBehavior(HitTestMode.Transparent)
+      }
+
+      // 设置页：盖住主界面，返回键也能退出
+      if (this.showSettings) {
+        this.settingsPage()
+      }
+
       // 启动黑屏过渡：盖住整个页面，初始化完成后淡出
       if (this.booting) {
         // 黑底不跟着淡出，只淡出文字/转圈，否则淡出那 200ms 会透出下面页面
@@ -1729,13 +1963,168 @@ struct Index {
 
   private setMeterMode(mode: string): void {
     this.meterMode = mode;
-    this.meterModeText = mode === 'matrix' ? '矩阵测光' : '点测光';
     this.applyMeterMode();
     this.savePref(Index.PREF_METER, mode);
     // 锁定态没有实时帧，要靠冻结帧重算
     if (this.locked) {
       this.remeter();
     }
+  }
+
+  private openSettings(): void {
+    this.showSettings = true;
+    console.info(`[SETTINGS] page open zoomMode=${this.zoomMode}`);
+  }
+
+  private closeSettings(): void {
+    this.showSettings = false;
+  }
+
+  /** 切换变焦模式：立刻换变焦方式，其他测光逻辑不动 */
+  private setZoomMode(mode: string): void {
+    if (this.zoomMode === mode) {
+      return;
+    }
+    this.zoomMode = mode;
+    this.savePref(Index.PREF_ZOOM_MODE, mode);
+    console.info(`[SETTINGS] zoomMode=${mode}`);
+    this.applyZoomMode();
+  }
+
+  /**
+   * 应用变焦模式：
+   *   normal → 把当前显示倍率重新下发给相机（裁切归 1）；
+   *   compat → 相机倍率钉到最小值，显示倍率落回最小值（裁切归 1），光圈用存量的常量。
+   */
+  private applyZoomMode(): void {
+    this.apMonitor.stopPolling();
+    const target: number = this.isCompat()
+      ? this.compatDefaultRatio()
+      : Math.max(this.zoomMin, Math.min(this.zoomRatio, this.zoomMax));
+    this.zoomTarget = target;
+    this.zoomAnim = target;
+    this.zoomPos = zoomToSliderPos(target, this.zoomMin, this.zoomUiMax());
+    this.applyZoom(target);
+    if (this.isCompat()) {
+      this.ensureCompatAperture();
+    } else {
+      // 切回普通模式：光圈文案要换回轮询口径，否则会一直挂着「兼容模式 · 固定光圈 …」
+      const r: ApReading | undefined = this.apMonitor.reading();
+      this.apText = r !== undefined
+        ? `当前光圈 f/${r.aperture.toFixed(1)} · 物理焦距 ${r.focal.toFixed(1)}mm`
+        : '光圈识别中…';
+    }
+    // 裁切变了，给相机的测光点要按新的裁切重新换算
+    this.updateMeterPoint();
+    this.statusText = this.isCompat() ? '兼容模式（裁切放大）' : '待测光（按住启动测光）';
+    // 锁定态没在取帧，用冻结帧重算一次，避免切模式后读数对不上
+    if (this.locked) {
+      this.remeter();
+    }
+    console.info(`[ZOOM] mode applied ${this.zoomMode} ui=${target.toFixed(2)}x ` +
+      `hw=${this.hwZoomOf(target).toFixed(2)}x crop=${this.cropScale().toFixed(2)}`);
+  }
+
+  /** 设置页里的单个模式选项 */
+  @Builder
+  zoomModeOption(mode: string, title: string, desc: string) {
+    Row({ space: 10 }) {
+      Column({ space: 4 }) {
+        Text(title)
+          .fontSize(15)
+          .fontColor(this.zoomMode === mode ? Color.White : '#DDDDDD')
+        Text(desc)
+          .fontSize(11)
+          .fontColor('#88FFFFFF')
+          .maxLines(2)
+          .lineHeight(15)
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+
+      Text(this.zoomMode === mode ? '✓' : '')
+        .fontSize(18)
+        .fontColor(Index.BLUE)
+        .width(18)
+    }
+    .width('100%')
+    .padding({ left: 14, right: 12, top: 12, bottom: 12 })
+    .backgroundColor('#1A1A1A')
+    .borderRadius(10)
+    .border({
+      width: 1,
+      color: this.zoomMode === mode ? Index.BLUE : '#2A2A2A'
+    })
+    .onClick(() => {
+      this.setZoomMode(mode);
+    })
+  }
+
+  /** 设置页（整页浮层，不新开路由，省掉一套全屏/安全区配置） */
+  @Builder
+  settingsPage() {
+    Stack() {
+      // 底层吸收点击：挡住下面的主界面，不把触摸漏给预览/按钮
+      // （不能用 HitTestMode.Block 盖在内容上 —— 它会连自己的子节点一起屏蔽，卡片就点不动了）
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor('#0E0E0E')
+        .hitTestBehavior(HitTestMode.Block)
+
+      Column({ space: 12 }) {
+        // 顶栏：返回 + 标题
+        Row() {
+          Text('‹ 返回')
+            .fontSize(14)
+            .fontColor('#7FB2FF')
+            .width(64)
+            .onClick(() => {
+              this.closeSettings();
+            })
+          Text('设置')
+            .fontSize(17)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Color.White)
+            .layoutWeight(1)
+            .textAlign(TextAlign.Center)
+          Text('')
+            .width(64)
+        }
+        .width('100%')
+        .height(48)
+
+        // 变焦模式
+        Column({ space: 8 }) {
+          Text('变焦模式')
+            .fontSize(12)
+            .fontColor('#99FFFFFF')
+            .width('100%')
+
+          this.zoomModeOption(Index.MODE_NORMAL, '普通模式',
+            '相机原生变焦，画面清晰、视场真实（默认）')
+          this.zoomModeOption(Index.MODE_COMPAT, '兼容模式',
+            '相机锁在最广角，靠裁切放大（最多 5 倍，画面会变糊）')
+        }
+        .width('100%')
+
+        Blank()
+      }
+      .width('100%')
+      .height('100%')
+      .padding({
+        left: 16,
+        right: 16,
+        top: this.safeTop + 4,
+        bottom: this.safeBottom + 8
+      })
+      .alignItems(HorizontalAlign.Start)
+      // 空白处也吃掉点击，免得穿透到下面的主界面（子节点的 onClick 照常生效）
+      .onClick(() => {
+      })
+    }
+    .width('100%')
+    .height('100%')
   }
 
   private applyMeterMode(): void {
@@ -1771,7 +2160,12 @@ struct Index {
       return;
     }
     try {
-      s.setMeteringPoint({ x: this.meterY, y: 1 - this.meterX });
+      // 相机坐标系是转置的；兼容模式取景框只显示画面正中一块，测光点也得跟着缩进那块里，
+      // 否则给相机的 AE 点会落在取景框外面（曝光按没用到的区域算，EV 就偏了）
+      const crop: number = this.cropScale();
+      const x: number = 0.5 + (this.meterY - 0.5) / crop;
+      const y: number = 0.5 + (0.5 - this.meterX) / crop;
+      s.setMeteringPoint({ x: x, y: y });
     } catch (e) {
       // 部分曝光模式不支持设点
     }
@@ -1798,7 +2192,9 @@ struct Index {
       combo = comboFor(ev, this.filmIso, APERTURE_LADDER[this.apIndex]);
       if (combo.outOfRange) {
         this.shLabel = combo.exact < SHUTTER_LADDER[0] ? Index.BLANK_TOP : Index.BLANK_BOTTOM;
-      } else if (combo.shutterIndex !== this.shIndex) {
+      } else {
+        // 无条件对齐：只在「下标变了」时才写 label 会留坑 ——
+        // 上一轮超范围把 label 写成了空白，回到范围内但下标没变时，空白就一直留在屏幕上
         this.shIndex = combo.shutterIndex;
         this.shLabel = this.shLabelFor(this.shIndex);
       }
@@ -1807,12 +2203,11 @@ struct Index {
       combo = comboFromShutter(ev, this.filmIso, SHUTTER_LADDER[this.shIndex]);
       if (combo.outOfRange) {
         this.apLabel = combo.exact < APERTURE_LADDER[0] ? Index.BLANK_TOP : Index.BLANK_BOTTOM;
-      } else if (combo.apertureIndex !== this.apIndex) {
+      } else {
         this.apIndex = combo.apertureIndex;
         this.apLabel = this.apLabelFor(this.apIndex);
       }
     }
-    this.longExposure = combo.longExposure;
     this.outOfRange = combo.outOfRange;
   }
 
@@ -1886,7 +2281,7 @@ struct Index {
         } catch (e) {
           console.error(`[LOCK] resume failed E${(e as BusinessError).code}, reopen`);
           this.locked = false;
-          this.lastRawEv = 0;
+          this.setRawEv(0);
           this.evText = 'XX';
           await this.reopenCamera();
           return;
@@ -1896,7 +2291,7 @@ struct Index {
         this.locked = false;
         // 取预览输出会把取帧那一路也拉起来，用完关掉
         this.setAnalyzerStream(false);
-        this.lastRawEv = 0;
+        this.setRawEv(0);
         this.evText = 'XX';
         this.statusText = '待测光（按住启动测光）';
       }
@@ -1911,27 +2306,35 @@ struct Index {
     try {
       await this.prefetchFrame();
 
-      const cur = this.apMonitor.reading();
-      const fresh: boolean = cur !== undefined && (Date.now() - cur.ts < 1500);
-      if (!fresh) {
-        if (!this.apMonitor.isWarmed()) {
-          await this.apMonitor.warmUp();
-        }
-        const afterWarm = this.apMonitor.reading();
-        const nowFresh: boolean = afterWarm !== undefined && (Date.now() - afterWarm.ts < 1500);
-        if (!nowFresh) {
-          await this.sleepMs(150);
-          await this.apMonitor.shootNow();
+      if (!this.isCompat()) {
+        // 普通模式：光圈可能随镜头变，锁定瞬间补拍一张
+        const cur = this.apMonitor.reading();
+        const fresh: boolean = cur !== undefined && (Date.now() - cur.ts < 1500);
+        if (!fresh) {
+          if (!this.apMonitor.isWarmed()) {
+            await this.apMonitor.warmUp();
+          }
+          const afterWarm = this.apMonitor.reading();
+          const nowFresh: boolean = afterWarm !== undefined && (Date.now() - afterWarm.ts < 1500);
+          if (!nowFresh) {
+            await this.sleepMs(150);
+            await this.apMonitor.shootNow();
+          }
         }
       }
 
       this.remeter();
-      const last = this.apMonitor.reading();
-      if (last !== undefined) {
-        this.apText = `当前光圈 f/${last.aperture.toFixed(1)} · 物理焦距 ${last.focal.toFixed(1)}mm`;
+      if (this.isCompat()) {
+        this.updateApText();
+      } else {
+        const last = this.apMonitor.reading();
+        if (last !== undefined) {
+          this.apText = `当前光圈 f/${last.aperture.toFixed(1)} · 物理焦距 ${last.focal.toFixed(1)}mm`;
+        }
       }
       this.statusText = this.computedKnown() ? '已锁定 · 可移动测光点' : '已锁定 · 无有效读数';
-      console.info(`[LOCK] measure done ev=${this.evText}`);
+      console.info(`[LOCK] measure done ev=${this.evText} ap=${this.apLabel} sh=${this.shLabel} ` +
+        `known=${this.computedKnown()} evKnown=${this.evKnown} oob=${this.outOfRange}`);
     } catch (e) {
       console.error(`[LOCK] measure failed E${(e as BusinessError).code}`);
     } finally {
@@ -2157,7 +2560,7 @@ struct Index {
       this.runStartupWarmup();
     }, 500);
     this.maybeFinishBoot();
-    this.lastRawEv = 0;
+    this.setRawEv(0);
     this.evText = 'XX';
     this.statusText = '待测光（按住启动测光）';
   }
@@ -2312,13 +2715,15 @@ struct Index {
     this.lastSampleMs = now;
     this.frameCount++;
     this.processedCount++;
-    this.computeSample(buf, w, h, stride);
+    // 一帧只建一次视图，亮度统计与快照共用（原来各建一个）
+    const data = new Uint8Array(buf);
+    this.computeSample(data, w, h, stride);
     if (this.lockPrep || this.frameCount % 3 === 0) {
-      this.saveSnapshot(buf, w, h, stride);
+      this.saveSnapshot(data, w, h, stride);
     }
   }
 
-  private saveSnapshot(buf: ArrayBuffer, w: number, h: number, stride: number): void {
+  private saveSnapshot(src: Uint8Array, w: number, h: number, stride: number): void {
     const STEP = 2;
     const sw = Math.floor(w / STEP);
     const sh = Math.floor(h / STEP);
@@ -2331,13 +2736,14 @@ struct Index {
       this.snapH = sh;
     }
     const snap = this.frameSnapshot;
-    const src = new Uint8Array(buf);
     for (let y = 0; y < sh; y++) {
       const rowOff = (y * STEP) * stride;
+      // 每行算一次上界，省掉逐像素的 length 比较
+      const rowEnd: number = Math.min(src.length, rowOff + w);
       const dst = y * sw;
       for (let x = 0; x < sw; x++) {
         const idx = rowOff + x * STEP;
-        snap[dst + x] = idx < src.length ? src[idx] : 0;
+        snap[dst + x] = idx < rowEnd ? src[idx] : 0;
       }
     }
   }
@@ -2376,21 +2782,13 @@ struct Index {
       return;
     }
     const shutterSec = durationUs / 1000000;
-    let raw = ev100From(this.apMonitor.aperture(), shutterSec, iso);
+    let raw = ev100From(this.meteringAperture(), shutterSec, iso);
 
-    let screenW = 0;
-    try {
-      screenW = display.getDefaultDisplaySync().width;
-    } catch (e) {
-      screenW = 1272;
-    }
-    const ringPx = vp2px(Index.RING_VP);
-    const previewW = screenW * Index.PREVIEW_WIDTH;
-    const ringRatio = previewW > 0 ? ringPx / previewW : 0.2;
-    const ringR = Math.max(1, (ringRatio * this.snapW) / 2);
+    const crop: number = this.cropScale();
+    const ringR = Math.max(1, (this.ringRatio() * this.snapW) / crop / 2);
 
-    const scx = this.snapW * this.meterY;
-    const scy = this.snapH * (1 - this.meterX);
+    const scx = this.snapW * (0.5 + (this.meterY - 0.5) / crop);
+    const scy = this.snapH * (0.5 + (0.5 - this.meterX) / crop);
     const localY = this.meterMode === 'matrix'
       ? this.matrixY
       : this.regionMeanSnap(scx, scy, ringR);
@@ -2400,7 +2798,7 @@ struct Index {
       raw += 2.2 * Math.log2(ratio);
     }
 
-    this.lastRawEv = raw;
+    this.setRawEv(raw);
     this.refreshDisplay();
     this.statusText = '锁定中 · 已测新点';
   }
@@ -2435,41 +2833,37 @@ struct Index {
     }
   }
 
-  private computeSample(buf: ArrayBuffer, w: number, h: number, stride: number): void {
-    const data = new Uint8Array(buf);
-    const cx = w * this.meterY;
-    const cy = h * (1 - this.meterX);
-    let screenW = 0;
-    try {
-      screenW = display.getDefaultDisplaySync().width;
-    } catch (e) {
-      screenW = 1272;
-    }
-    const ringPx = vp2px(Index.RING_VP);
-    const previewW = screenW * Index.PREVIEW_WIDTH;
-    const ringRatio = previewW > 0 ? ringPx / previewW : 0.2;
-    const ringR = Math.max(2, (ringRatio * w) / 2);
-    const refR = Math.max(4, 0.079 * w);
+  private computeSample(data: Uint8Array, w: number, h: number, stride: number): void {
+    // 兼容模式实际看到的是画面正中的一块，测光也必须只在这块里取（换算见 cropScale）
+    const crop: number = this.cropScale();
+    const cx = w * (0.5 + (this.meterY - 0.5) / crop);
+    const cy = h * (0.5 + (0.5 - this.meterX) / crop);
+    const ringR = Math.max(2, (this.ringRatio() * w) / crop / 2);
+    const refR = Math.max(4, 0.079 * w / crop);
     this.localY = this.regionMean(data, w, h, stride, cx, cy, ringR);
     this.refY = this.regionMean(data, w, h, stride, cx, cy, refR);
     if (this.meterMode === 'matrix') {
-      this.matrixY = this.matrixMean(data, w, h, stride);
+      this.matrixY = this.matrixMean(data, w, h, stride, crop);
     }
   }
 
-  private matrixMean(data: Uint8Array, w: number, h: number, stride: number): number {
+  private matrixMean(data: Uint8Array, w: number, h: number, stride: number, crop: number): number {
     const COLS = 12;
     const ROWS = 16;
-    // 原生变焦是相机端裁切，帧本身就是最终视场，这里不再按倍率二次裁
-    const cellW = w / COLS;
-    const cellH = h / ROWS;
+    // 原生变焦是相机端裁切，帧本身就是最终视场；兼容模式的裁切在这里按中心窗口算
+    const visW = w / crop;
+    const visH = h / crop;
+    const ox = (w - visW) / 2;
+    const oy = (h - visH) / 2;
+    const cellW = visW / COLS;
+    const cellH = visH / ROWS;
 
     let total = 0;
     let cells = 0;
     for (let r = 0; r < ROWS; r++) {
       for (let c = 0; c < COLS; c++) {
-        const ccx = (c + 0.5) * cellW;
-        const ccy = (r + 0.5) * cellH;
+        const ccx = ox + (c + 0.5) * cellW;
+        const ccy = oy + (r + 0.5) * cellH;
         let sum = 0;
         let n = 0;
         for (let dy = 0; dy < 4; dy++) {
@@ -2497,6 +2891,22 @@ struct Index {
       }
     }
     return cells > 0 ? total / cells : 0;
+  }
+
+  /** 点测圈占画面宽度的比例（缓存；屏幕尺寸变化时把 ringRatioCache 清 0 即可） */
+  private ringRatio(): number {
+    if (this.ringRatioCache > 0) {
+      return this.ringRatioCache;
+    }
+    let screenW = 0;
+    try {
+      screenW = display.getDefaultDisplaySync().width;
+    } catch (e) {
+      screenW = 1272;
+    }
+    const previewW = screenW * Index.PREVIEW_WIDTH;
+    this.ringRatioCache = previewW > 0 ? vp2px(Index.RING_VP) / previewW : 0.2;
+    return this.ringRatioCache;
   }
 
   private regionMean(data: Uint8Array, w: number, h: number, stride: number,
@@ -2535,7 +2945,7 @@ struct Index {
     }
 
     const shutterSec = durationUs / 1000000;
-    let raw = ev100From(this.apMonitor.aperture(), shutterSec, iso);
+    let raw = ev100From(this.meteringAperture(), shutterSec, iso);
 
     const sampleY = this.meterMode === 'matrix' ? this.matrixY : this.localY;
     let corrected = false;
@@ -2545,7 +2955,7 @@ struct Index {
       corrected = true;
     }
 
-    this.lastRawEv = raw;
+    this.setRawEv(raw);
     this.evText = this.displayEv().toFixed(1);
     this.updateCombo();
 
@@ -2556,7 +2966,8 @@ struct Index {
       this.stableCount = 0;
       this.lastKey = key;
     }
-    if (this.apMonitor.reading() === undefined) {
+    if (!this.isCompat() && this.apMonitor.reading() === undefined) {
+      // 普通模式下光圈还没测到，读数只是按兜底 f/2.2 估的。兼容模式光圈是常量，不用提示
       this.statusText = '测光中（光圈未定，按 f/2.2 估）';
       return;
     }
